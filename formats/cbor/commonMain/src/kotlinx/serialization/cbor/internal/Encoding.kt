@@ -17,6 +17,7 @@ private const val FALSE = 0xf4
 private const val TRUE = 0xf5
 private const val NULL = 0xf6
 
+private const val NEXT_HALF = 0xf9
 private const val NEXT_FLOAT = 0xfa
 private const val NEXT_DOUBLE = 0xfb
 
@@ -397,15 +398,22 @@ internal class CborDecoder(private val input: ByteArrayInput) {
     }
 
     fun nextFloat(): Float {
-        if (curByte != NEXT_FLOAT) throw CborDecodingException("float header", curByte)
-        val res = Float.fromBits(readInt())
+        val res: Float = when(curByte) {
+            NEXT_FLOAT -> Float.fromBits(readInt())
+            NEXT_HALF -> Float.fromBits(halfToFloat(readShort()))
+            else -> throw CborDecodingException("float header", curByte)
+        }
         readByte()
         return res
     }
 
     fun nextDouble(): Double {
-        if (curByte != NEXT_DOUBLE) throw CborDecodingException("double header", curByte)
-        val res = Double.fromBits(readLong())
+        val res: Double = when(curByte) {
+            NEXT_DOUBLE -> Double.fromBits(readLong())
+            NEXT_FLOAT -> Float.fromBits(readInt()).toDouble()
+            NEXT_HALF -> Double.fromBits(halfToDouble(readShort()))
+            else -> throw CborDecodingException("double header", curByte)
+        }
         readByte()
         return res
     }
@@ -417,6 +425,12 @@ internal class CborDecoder(private val input: ByteArrayInput) {
             result = (result shl 8) or byte.toLong()
         }
         return result
+    }
+
+    private fun readShort(): Short {
+        val highByte = input.read()
+        val lowByte = input.read()
+        return (highByte shl 8 or lowByte).toShort()
     }
 
     private fun readInt(): Int {
@@ -467,3 +481,74 @@ private fun Iterable<ByteArray>.flatten(): ByteArray {
 private fun SerialDescriptor.isByteString(index: Int): Boolean =
     getElementDescriptor(index) == ByteArraySerializer().descriptor &&
         getElementAnnotations(index).find { it is ByteString } != null
+
+private fun halfToDouble(bits: Short): Long {
+    val sign = (bits.toLong() shr 15 and 0x0001)
+    val halfExp = bits.toLong() shr 10 and 0x1f //max half exponent value
+    val halfMant = bits.toLong() and 0x3ff //max half mantis value
+
+    var exp: Long
+    var mant: Long
+
+    if (halfExp == 0x1fL) {//max half exponent value
+        //if mantissa maximal - value is NaN or Infinity
+        exp = 0x7FF //max double exponent value
+        mant = halfMant
+    } else if (halfExp == 0L) {
+        if (halfMant == 0L) {
+            //if exponent and mantissa are zero - value is zero
+            mant = 0
+            exp = 0
+        } else {
+            //if exponent is zero and mantissa non-zero - value denormalized. normalize it
+            exp = halfExp + 1008 + 1 //double exponent bias - half exponent bias = 1023 - 15
+            mant = halfMant
+            while (mant <= 0x3ff) {//max half mantis value
+                mant = mant shl 1
+                exp--
+            }
+
+            mant = mant and 0x3ff //max half mantis value
+        }
+    } else {
+        //normalized value
+        exp = (halfExp + 1008) //double exponent bias - half exponent bias = 1023 - 15
+        mant = halfMant
+    }
+    return (sign shl 63) or (exp shl 52) or (mant shl 42)
+}
+
+private fun halfToFloat(bits: Short): Int {
+    val sign = (bits.toInt() shr 15 and 0x0001)
+    val halfExp = bits.toInt() shr 10 and 0x1f //max half exponent value
+    val halfMant = bits.toInt() and 0x3ff //max half mantis value
+
+    var exp: Int
+    var mant: Int
+
+    if (halfExp == 0x1f) {//max half exponent value
+        //if mantissa maximal - value is NaN or Infinity
+        exp = 0xFF //max float exponent value
+        mant = halfMant
+    } else if (halfExp == 0) {
+        if (halfMant == 0) {
+            //if exponent and mantissa are zero - value is zero
+            mant = 0
+            exp = 0
+        } else {
+            //if exponent is zero and mantissa non-zero - value denormalized. normalize it
+            exp = halfExp + 112 + 1 //float exponent bias - half exponent bias = 127 - 15
+            mant = halfMant
+            while (mant <= 0x3ff) {//max half mantis value
+                mant = mant shl 1
+                exp--
+            }
+            mant = mant and 0x3ff //max half mantis value
+        }
+    } else {
+        //normalized value
+        exp = (halfExp + 112) //float exponent bias - half exponent bias = 127 - 15
+        mant = halfMant
+    }
+    return (sign shl 31) or (exp shl 23) or (mant shl 13)
+}
